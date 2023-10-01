@@ -9,21 +9,47 @@ import os
 
 
 # Path ke direktori dataset
-dataset_dir = './Data TA' 
+dataset_dir = './ExtractedFaces' 
+# Impor library OpenCV
+import cv2
 
-# Fungsi untuk membaca dan melakukan preprocessing pada gambar wajah
+# Load classifier Haar Cascade untuk deteksi wajah
+face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
+
+# Fungsi untuk mendeteksi wajah dalam gambar
+def detect_face(image):
+    # Konversi gambar ke dalam format OpenCV
+    image_cv2 = np.array(image)
+    # Ubah ke skala abu-abu
+    gray = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2GRAY)
+    
+    # Deteksi wajah
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    
+    # Jika wajah ditemukan, kembalikan gambar dengan kotak wajah
+    if len(faces) > 0:
+        for (x, y, w, h) in faces:
+            cv2.rectangle(image_cv2, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        return Image.fromarray(image_cv2), True
+    else:
+        return image, False
+
 def preprocess_image(image_path):
     # Baca gambar wajah menggunakan OpenCV
     image = cv2.imread(image_path)
 
+    # Resize gambar ke ukuran 70x80 pixel
+    resized_image = cv2.resize(image, (100, 100))
+
     # Ubah ke skala abu-abu
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
 
     # Menghapus noise dengan filter median
     gray = cv2.medianBlur(gray, ksize=3)
 
-    # Normalisasi nilai piksel
-    normalized = gray / 255.0
+    # Normalisasi nilai piksel dan ubah ke tipe data float32
+    normalized = gray.astype(np.float32) / 255.0
 
     return normalized
 
@@ -49,7 +75,11 @@ def load_dataset():
                     images.append(preprocessed_image)
                     labels.append(class_label)
 
-    return np.array(images), np.array(labels)
+    # Mengubah list menjadi numpy arrays dan menampilkan tipe datanya
+    images = np.array(images)
+    labels = np.array(labels)
+    return images, labels
+
 
 # Memuat dataset
 images, labels = load_dataset()
@@ -71,31 +101,12 @@ train_labels_encoded = label_encoder.fit_transform(train_labels)
 test_labels_encoded = label_encoder.transform(test_labels)
 
 # Konversi numpy array menjadi PyTorch tensors
-train_images = torch.from_numpy(train_images).unsqueeze(1).float()
-train_labels = torch.from_numpy(train_labels_encoded).long()
-test_images = torch.from_numpy(test_images).unsqueeze(1).float()
-test_labels = torch.from_numpy(test_labels_encoded).long()
+train_images_face = torch.from_numpy(train_images).unsqueeze(1).float()
+train_labels_face = torch.from_numpy(train_labels_encoded).long()
+test_images_face = torch.from_numpy(test_images).unsqueeze(1).float()
+test_labels_face = torch.from_numpy(test_labels_encoded).long()
 
-# Definisikan arsitektur model Anda
-class SqueezeExcitation(nn.Module):
-    def __init__(self, input_channels, squeeze_ratio=4):
-        super(SqueezeExcitation, self).__init__()
-        squeeze_channels = input_channels // squeeze_ratio
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(input_channels, squeeze_channels, kernel_size=1, bias=True)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(squeeze_channels, input_channels, kernel_size=1, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        out = self.avg_pool(x)
-        out = self.fc1(out)
-        out = self.relu(out)
-        out = self.fc2(out)
-        out = self.sigmoid(out)
-        out = x * out
-        return out
-
+# Definisikan Ghost Module
 class GhostModule(nn.Module):
     def __init__(self, input_channels, output_channels, kernel_size=1, ratio=2):
         super(GhostModule, self).__init__()
@@ -107,14 +118,13 @@ class GhostModule(nn.Module):
             nn.BatchNorm2d(internal_channels),
             nn.ReLU(inplace=True)
         )
-        self.squeeze_excitation = SqueezeExcitation(internal_channels)
 
     def forward(self, x):
         primary_conv = self.primary_conv(x)
         cheap_operation = self.cheap_operation(primary_conv)
-        cheap_operation = self.squeeze_excitation(cheap_operation)
         return torch.cat((primary_conv, cheap_operation), 1)
 
+# Definisikan GhostNet
 class GhostNet(nn.Module):
     def __init__(self, num_classes=8):
         super(GhostNet, self).__init__()
@@ -176,17 +186,26 @@ model.eval()
 app = Flask(__name__)
 
 # Fungsi untuk memproses gambar dan melakukan prediksi
+import numpy as np
+
+# Fungsi untuk memproses gambar dan melakukan prediksi
 def predict_face(image):
+    # Deteksi wajah dalam gambar
+    detected_image, face_detected = detect_face(image)
+    
+    if not face_detected:
+        return 'No Face Detected'
+    
     # Konversi gambar ke grayscale
-    image = image.convert('L')
+    gray_image = detected_image.convert('L')
 
     transform = transforms.Compose([
         transforms.Resize((70, 80)),
-        transforms.ToTensor()  
+        transforms.ToTensor()
     ])
 
     # Preprocess gambar
-    image_tensor = transform(image).unsqueeze(1).float()
+    image_tensor = transform(gray_image).unsqueeze(1).float()
 
     # Lakukan prediksi menggunakan model
     with torch.no_grad():
@@ -196,10 +215,11 @@ def predict_face(image):
     # Ubah indeks prediksi menjadi nama label kelas
     predicted_label = label_encoder.classes_[predicted_idx]
 
-    # Simpan gambar dalam format PNG
-    image.save(f'predicted_face_{predicted_label}.png')
+    # Hitung akurasi prediksi
+    confidence = torch.softmax(outputs, dim=1)[0][predicted_idx.item()].item() * 100
 
-    return predicted_label
+    return f'Predicted Label: {predicted_label}, Confidence: {confidence:.2f}%'
+
 
 @app.route('/recognize', methods=['POST'])
 def recognize_face():
@@ -215,11 +235,17 @@ def recognize_face():
         prediction = predict_face(image)
 
         # Misalnya, tambahkan pesan status sukses
-        response = {
-            'status': 'success',
-            'prediction': prediction,
-            'message': 'Face recognized successfully.'
-        }
+        if prediction == 'No Face Detected':
+            response = {
+                'status': 'success',
+                'message': 'No face detected in the image.'
+            }
+        else:
+            response = {
+                'status': 'success',
+                'prediction': prediction,
+                'message': 'Face recognized successfully.'
+            }
 
         # Kembalikan respon JSON
         return jsonify(response)
@@ -227,6 +253,7 @@ def recognize_face():
     except Exception as e:
         # Jika terjadi error saat pengenalan wajah, berikan pesan error yang lebih spesifik
         return jsonify({'error': 'Face recognition failed: {}'.format(str(e))})
+
 
 
 if __name__ == '__main__':
